@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quantai"
+version = "0.1.0"
+description = "多源数据驱动的 IM 股指期货 T+0 LLM 量化交易机器人"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "QuantAI Contributors" }]
+keywords = ["quant", "trading", "llm", "agent", "futures", "im", "tqsdk", "t0"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "tqsdk>=3.0.0",
+    "akshare>=1.12.0",
+    "efinance>=0.5.0",
+    "yfinance>=0.2.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "requests>=2.31.0",
+    "fake-useragent>=1.4.0",
+    "openai>=1.30.0",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.5.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.4.0", "pytest-mock>=3.12.0", "pytest-cov>=4.1.0"]
+dev = ["ruff>=0.4.0", "mypy>=1.8.0"]
+
+[project.scripts]
+quantai = "quantai.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["quantai*"]
+exclude = ["tests*", "docs*", "scripts*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q --strict-markers"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+ignore_missing_imports = true
