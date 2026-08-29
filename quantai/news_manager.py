@@ -1,108 +1,102 @@
-"""金十快讯抓取后台循环.
+"""news_manager — Jin10 新闻后台抓取（真源 L907–947 类化迁移）。
 
-封装 ``Jin10FlashFetcher``（位于 :mod:`quantai.vendor`），
-提供历史回补 + 周期增量拉取 + 线程安全读取。
+行为保持:
+- 后台线程每 300s 抓取一次增量新闻
+- 首次运行先回补上一交易日 15:00 以来的历史新闻
+- 缓存上限 NEWS_CACHE_MAX(200)，增量与回补均遵守（修复 M3）
+
+与原版差异（依赖注入，解耦 market_data）:
+- 原版 _backfill_historical_news 直接调 self._get_previous_trading_day_15；
+  本版通过 prev_trading_day_fn 注入（phase 2 由 TradingCalendar 提供），
+  未注入时回补退化为"从现在开始"，不阻塞骨架期使用。
 """
-from __future__ import annotations
-
 import logging
 import threading
 import time
-from datetime import datetime, timedelta
-from typing import Optional
+from datetime import datetime
+from typing import Callable, List, Optional
 
-from .config import trading
-from .vendor.jin10_news_fetcher import Jin10FlashFetcher
-
-logger = logging.getLogger(__name__)
+from . import config
 
 
 class NewsManager:
-    """金十快讯订阅器：5 分钟轮询 + 历史回补."""
-
-    def __init__(
-        self,
-        fetcher: Optional[Jin10FlashFetcher] = None,
-        fetch_interval_sec: int = 300,
-        previous_trading_day_resolver=None,
-    ) -> None:
-        self.fetcher = fetcher or Jin10FlashFetcher()
-        self.fetch_interval_sec = fetch_interval_sec
-        self._cache: list[dict] = []
-        self._lock = threading.Lock()
+    def __init__(self,
+                 fetcher=None,
+                 prev_trading_day_fn: Optional[Callable[[datetime], datetime]] = None):
+        if fetcher is None:
+            from .vendor.jin10_news_fetcher import Jin10FlashFetcher
+            fetcher = Jin10FlashFetcher()
+        self.fetcher = fetcher
+        self.prev_trading_day_fn = prev_trading_day_fn
+        self.news_cache: List[dict] = []
+        self.news_lock = threading.Lock()
+        self.news_thread_running = False
+        self.history_backfilled = False
         self._thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-        self._backfilled = False
-        self._resolver = previous_trading_day_resolver
 
+    # ---------- 线程生命周期 ----------
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
+        if self._thread is not None and self._thread.is_alive():
             return
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True, name="NewsManager")
+        self.news_thread_running = True
+        self._thread = threading.Thread(target=self._news_fetcher_loop, daemon=True)
         self._thread.start()
+        logging.info("新闻抓取线程已启动")
 
     def stop(self) -> None:
-        self._stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=2)
+        self.news_thread_running = False
 
-    def snapshot(self) -> list[dict]:
-        with self._lock:
-            return list(self._cache)
-
-    def to_prompt_block(self) -> str:
-        items = self.snapshot()
-        if not items:
-            return "（无重要快讯）"
-        return "\n".join(
-            f"- {it.get('time', '未知时间')}: {it.get('data', {}).get('content', '无内容')}"
-            for it in items
-        )
-
-    def _loop(self) -> None:
+    # ---------- 真源 L907–931 ----------
+    def _news_fetcher_loop(self):
         last_fetch = datetime.now()
-        while not self._stop_event.is_set():
+        while self.news_thread_running:
+            # 首次运行时进行历史回补
+            if not self.history_backfilled:
+                self._backfill_historical_news()
+                self.history_backfilled = True
+                # 回补完成后，将 last_fetch 设为当前，避免重复抓取
+                last_fetch = datetime.now()
+
+            now = datetime.now()
+            start_str = last_fetch.strftime("%Y-%m-%d %H:%M:%S")
+            end_str = now.strftime("%Y-%m-%d %H:%M:%S")
             try:
-                if not self._backfilled:
-                    self._backfill_history()
-                    self._backfilled = True
-                    last_fetch = datetime.now()
+                new_news = self.fetcher.fetch_important_news(start_str, end_str)
+                if new_news:
+                    with self.news_lock:
+                        self.news_cache.extend(new_news)
+                        # 修复 M3: 缓存上限，防止长时间运行无限膨胀
+                        if len(self.news_cache) > config.NEWS_CACHE_MAX:
+                            self.news_cache = self.news_cache[-config.NEWS_CACHE_MAX:]
+            except Exception as e:
+                logging.warning(f"新闻抓取失败: {e}")
+            last_fetch = now
+            time.sleep(300)  # 5分钟抓取一次
 
-                now = datetime.now()
-                start_str = last_fetch.strftime("%Y-%m-%d %H:%M:%S")
-                end_str = now.strftime("%Y-%m-%d %H:%M:%S")
-                news = self.fetcher.fetch_important_news(start_str, end_str)
-                if news:
-                    with self._lock:
-                        self._cache.extend(news)
-                last_fetch = now
-            except Exception as exc:
-                logger.warning("Jin10 news fetch failed: %s", exc)
-            self._stop_event.wait(self.fetch_interval_sec)
-
-    def _backfill_history(self) -> None:
-        prev_day = self._resolve_previous_trading_day()
-        start_str = prev_day.strftime("%Y-%m-%d %H:%M:%S")
+    # ---------- 真源 L933–947 ----------
+    def _backfill_historical_news(self):
+        if self.prev_trading_day_fn is not None:
+            prev_trading_day = self.prev_trading_day_fn(datetime.now())
+        else:
+            # 注入缺省: 从当前时刻开始（骨架期可用；phase 2 接 TradingCalendar 后恢复原行为）
+            prev_trading_day = datetime.now()
+            logging.warning("prev_trading_day_fn 未注入，历史新闻回补退化为从当前时刻开始")
+        start_str = prev_trading_day.strftime("%Y-%m-%d %H:%M:%S")
         end_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        logger.info("Backfilling news: %s -> %s", start_str, end_str)
+        logging.info(f"回补历史新闻: {start_str} → {end_str}")
         try:
             news = self.fetcher.fetch_important_news(start_str, end_str)
             if news:
-                with self._lock:
-                    self._cache.extend(news)
-        except Exception as exc:
-            logger.error("Backfill failed: %s", exc)
+                with self.news_lock:
+                    self.news_cache.extend(news)
+                    # 修复 M3: 回补也遵守缓存上限
+                    if len(self.news_cache) > config.NEWS_CACHE_MAX:
+                        self.news_cache = self.news_cache[-config.NEWS_CACHE_MAX:]
+        except Exception as e:
+            logging.error(f"历史新闻回补失败: {e}")
 
-    def _resolve_previous_trading_day(self) -> datetime:
-        if self._resolver:
-            try:
-                return self._resolver(datetime.now())
-            except Exception as exc:
-                logger.warning("Custom resolver failed: %s; fallback to T-1.", exc)
-        return (datetime.now() - timedelta(days=1)).replace(
-            hour=15, minute=0, second=0, microsecond=0
-        )
-
-
-__all__ = ["NewsManager"]
+    # ---------- 读取接口 ----------
+    def get_news(self) -> List[dict]:
+        """线程安全读取当前新闻缓存快照。"""
+        with self.news_lock:
+            return list(self.news_cache)

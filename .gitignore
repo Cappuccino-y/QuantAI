@@ -1,74 +1,25 @@
-# ==================== 凭证与敏感数据（绝不入库） ====================
-.env
-.env.local
-.env.*.local
-*.pem
-*.key
-secrets/
+# ===== 运行时产物（data/ 由 config.py 启动时自动创建）=====
+data/
 
-# ==================== 运行时状态/日志（避免污染仓库） ====================
-position_state.pkl
-position_state.*
-trade_log.csv
-ai_decisions.jsonl
-performance_metrics.csv
-trading.log
-trading.log.*
-data/*.pkl
-data/*.csv
-data/*.jsonl
-data/*.log
-data/*.log.*
-
-# ==================== Python 编译产物 ====================
+# ===== Python =====
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-*.egg
 *.egg-info/
-dist/
-build/
-.eggs/
-.installed.cfg
-develop-eggs/
-wheels/
-
-# ==================== 测试与覆盖率 ====================
 .pytest_cache/
-.coverage
-.coverage.*
-htmlcov/
-.tox/
-.nox/
-.hypothesis/
-.cache/
-nosetests.xml
-coverage.xml
-*.cover
-
-# ==================== 虚拟环境 ====================
 .venv/
 venv/
-env/
-ENV/
 
-# ==================== IDE / 编辑器 ====================
+# ===== 环境与密钥（仅允许 .env.example 入库）=====
+.env
+.env.*
+!.env.example
+
+# ===== 状态/序列化文件 =====
+*.pkl
+*.pickle
+
+# ===== IDE / OS =====
 .idea/
 .vscode/
-*.swp
-*.swo
-*~
 .DS_Store
 Thumbs.db
-
-# ==================== Jupyter ====================
-.ipynb_checkpoints/
-*.ipynb
-
-# ==================== mypy / ruff ====================
-.mypy_cache/
-.dmypy.json
-dmypy.json
-.ruff_cache/

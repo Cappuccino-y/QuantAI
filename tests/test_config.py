@@ -1,72 +1,73 @@
-"""配置层加载校验单测."""
-from __future__ import annotations
+"""config 常量与真源逐项对拍测试。
 
-import importlib
+真源: D:/PythonProject/MainToy/trade/autotrade_fix.py L27–157
+验收标准（design.md §三.4）: 所有阈值原样迁移，作为行为等价 checklist 的一部分。
+"""
+import os
+import sys
 
-import pytest
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-
-@pytest.fixture(autouse=True)
-def _reload_config(monkeypatch: pytest.MonkeyPatch):
-    """每个测试重载 config 以反映新的环境变量."""
-    import quantai.config as cfg
-    importlib.reload(cfg)
-    yield
-    importlib.reload(cfg)
+from quantai import config
 
 
-class TestEnvLoading:
-    def test_account_loaded(self) -> None:
-        from quantai.config import account
-        assert account.account == "test_account"
-        assert account.password == "test_password"
-        assert account.use_sim is True
-
-    def test_llm_loaded(self) -> None:
-        from quantai.config import llm
-        assert llm.api_key == "test_llm_key"
-        assert llm.model_id == "gpt-4o-mini"
-
-    def test_trading_defaults(self) -> None:
-        from quantai.config import trading
-        assert trading.contract_multiplier == 200
-        assert trading.margin_rate == 0.15
-        assert 0 < trading.min_confidence < 1
-        assert trading.stopout_cooldown_sec > 0
-
-
-class TestCredentialsValidation:
-    def test_missing_password_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("TQ_PASSWORD", "")
-        import quantai.config as cfg
-        importlib.reload(cfg)
-        with pytest.raises(RuntimeError, match="缺少天勤凭证"):
-            cfg.ensure_credentials(require_llm=False)
-
-    def test_missing_llm_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("LLM_API_KEY", "")
-        import quantai.config as cfg
-        importlib.reload(cfg)
-        with pytest.raises(RuntimeError, match="缺少 LLM 配置项"):
-            cfg.ensure_credentials(require_llm=True)
-
-    def test_notify_enabled_but_webhook_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("ENABLE_NOTIFY", "True")
-        monkeypatch.setenv("DINGTALK_WEBHOOK", "")
-        import quantai.config as cfg
-        importlib.reload(cfg)
-        with pytest.raises(RuntimeError, match="DINGTALK_WEBHOOK"):
-            cfg.ensure_credentials(require_llm=False)
-
-    def test_pass_when_all_set(self) -> None:
-        import quantai.config as cfg
-        cfg.ensure_credentials(require_llm=True)
+def test_risk_constants_match_source():
+    """P0/P1 风控常量逐项对拍（真源 L107–143）。"""
+    assert config.BASE_DECISION_INTERVAL == 900
+    assert config.SHORT_TERM_INTERVAL == 300
+    assert config.MIN_DECISION_INTERVAL == 300
+    assert config.MAX_DECISION_INTERVAL == 1200
+    assert config.SCALPING_ATR_RATIO == 1.3
+    assert config.BREAKOUT_THRESHOLD == 0.3
+    assert config.STOP_ADJUST_COOLDOWN == 300
+    assert config.STOP_RELAX_REQUIRED_CONFIDENCE == 0.75
+    assert config.MIN_STOP_DISTANCE_ATR_MULT == 0.8
+    assert config.MIN_STOP_DISTANCE_ATR_MULT_COND == 0.6
+    assert config.ADD_REQUIRED_CONFIDENCE == 0.70
+    assert config.ADD_MIN_PRICE_GAP_ATR == 1.0
+    assert config.ADD_MAX_DRAWDOWN_PCT == 1.5
+    assert config.MAX_POSITION_LOTS == 3
+    assert config.STOPOUT_COOLDOWN_SEC == 900
+    assert config.EMERGENCY_AUTO_RESET_SEC == 1800
+    assert config.MAX_RISK_PCT == 0.01
+    assert config.MAX_STOP_DISTANCE_ATR_MULT == 3.0
+    assert config.MAX_ROUND_TRIPS_PER_DAY == 6
+    assert config.DAILY_LOSS_WARN_RATIO == 0.6
 
 
-class TestPaths:
-    def test_paths_pointing_under_data_dir(self) -> None:
-        from quantai.config import paths, runtime
-        for key, p in paths.items():
-            assert str(p).startswith(str(runtime.data_dir)), (
-                f"path {key}={p} not under data_dir={runtime.data_dir}"
-            )
+def test_notify_constants_match_source():
+    """通知常量对拍（真源 L58–69, L38）。"""
+    assert config.NOTIFY_RATE_LIMIT == 10
+    assert config.NOTIFY_DEDUP_WINDOW == 300
+    assert config.NEWS_CACHE_MAX == 200
+    assert config.NOTIFY_DEDUP_TABLE_MAX == 200
+    for kw in ("平仓成功", "开仓成功", "条件单入场", "成交:", "熔断", "失败",
+               "紧急", "请手动", "手动处理", "止损触发", "过期条件单", "重连"):
+        assert kw in config.NOTIFY_CRITICAL_KEYWORDS
+
+
+def test_min_confidence():
+    assert config.MIN_CONFIDENCE == 0.55
+
+
+def test_no_hardcoded_credentials():
+    """账密必须来自 .env，源码中不得出现硬编码（真源 L99-100 的修复项）。"""
+    src = open(config.__file__, encoding="utf-8").read()
+    assert '"lyy121200"' not in src
+    assert '"Lyy121200@"' not in src
+
+
+def test_paths_under_data_dir():
+    assert config.POSITION_FILE.endswith("position_state.pkl")
+    assert config.LOG_FILE.endswith("trading.log")
+    assert config.TRADE_LOG_FILE.endswith("trade_log.csv")
+    assert config.METRICS_FILE.endswith("performance_metrics.csv")
+    assert config.AI_DECISIONS_FILE.endswith("ai_decisions.jsonl")
+    assert config.TRADES_HISTORY_FILE.endswith("trades_history.jsonl")
+    assert config.CIRCUIT_BREAKER_FILE.endswith("circuit_breaker_state.json")
+    assert config.PERF_STATE_FILE.endswith("performance_state.json")
+    for p in (config.POSITION_FILE, config.LOG_FILE, config.TRADE_LOG_FILE,
+              config.METRICS_FILE, config.AI_DECISIONS_FILE,
+              config.TRADES_HISTORY_FILE, config.CIRCUIT_BREAKER_FILE,
+              config.PERF_STATE_FILE):
+        assert os.path.dirname(p) == config.DATA_DIR

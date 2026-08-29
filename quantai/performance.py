@@ -1,94 +1,128 @@
-"""交易绩效指标：胜率、盈亏比、回撤、连胜.
+"""performance — 交易绩效记录器（真源 L188–384 逐行迁移）。
 
-每次平仓后调用 :py:meth:`PerformanceMetrics.record_trade`；
-每个 tick 可调用 :py:meth:`update_equity` 更新权益曲线。
+在交易过程中持续追踪胜率、盈亏比、最大回撤、单笔风险占比等关键指标。
+每次 CLOSE 触发时调用 record_trade()，每个 tick 可调用 update_equity() 更新权益曲线。
 """
-from __future__ import annotations
-
 import csv
+import json
 import logging
-from dataclasses import dataclass, field
+import os
 from datetime import datetime
-from pathlib import Path
-from typing import Optional
 
-from .config import paths
-
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class CompletedTrade:
-    pnl: float
-    direction: str
-    volume: int
-    entry_price: float
-    exit_price: float
-    entry_time: datetime
-    exit_time: datetime
-
-
-@dataclass
-class MetricsSummary:
-    trade_count: int = 0
-    win_count: int = 0
-    loss_count: int = 0
-    win_rate: float = 0.0
-    avg_pnl: float = 0.0
-    avg_win: float = 0.0
-    avg_loss: float = 0.0
-    profit_factor: float = 0.0
-    max_drawdown: float = 0.0
-    current_streak: int = 0
+from . import config
 
 
 class PerformanceMetrics:
-    """绩效记录器：持续追踪胜率、盈亏比、最大回撤等指标."""
-
-    HEADER = [
-        "timestamp", "balance", "peak_balance", "drawdown",
-        "trade_count", "win_count", "loss_count", "win_rate",
-        "avg_pnl", "avg_win", "avg_loss", "profit_factor",
-        "max_drawdown", "current_streak",
-    ]
-
-    def __init__(self, metrics_file: Optional[Path] = None) -> None:
-        self.metrics_file: Path = Path(metrics_file) if metrics_file else paths["performance_metrics"]
-        self.trades: list[CompletedTrade] = []
-        self.equity_curve: list[tuple[datetime, float]] = []
-        self.peak_balance: float = 0.0
-        self.peak_balance_time: Optional[datetime] = None
-        self.max_drawdown: float = 0.0
+    def __init__(self):
+        self.trades = []               # [(pnl, entry_time, exit_time, direction, volume, entry_price, exit_price), ...]
+        self.equity_curve = []         # [(timestamp, balance), ...]
+        self.peak_balance = 0.0
+        self.max_drawdown = 0.0
+        self.peak_balance_time = None
+        # 修复 M5: 启动时恢复历史交易与绩效状态，避免重启清零
+        self._load_trades()
+        self._load_perf_state()
         self._init_file()
 
-    def _init_file(self) -> None:
-        self.metrics_file.parent.mkdir(parents=True, exist_ok=True)
-        if not self.metrics_file.exists():
-            with self.metrics_file.open("w", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow(self.HEADER)
+    # ========== 修复 M5: 交易/绩效持久化 ==========
+    def _load_trades(self):
+        """从 JSONL 恢复历史交易记录（重启后胜率/盈亏比/连击不丢失）"""
+        if not os.path.exists(config.TRADES_HISTORY_FILE):
+            return
+        try:
+            with open(config.TRADES_HISTORY_FILE, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    trade = json.loads(line)
+                    # 时间字段恢复为 datetime（兼容保存前的字符串化）
+                    for k in ('entry_time', 'exit_time'):
+                        v = trade.get(k)
+                        if v:
+                            try:
+                                trade[k] = datetime.fromisoformat(v)
+                            except Exception:
+                                pass
+                    self.trades.append(trade)
+            logging.info(f"加载历史交易记录: {len(self.trades)} 笔")
+        except Exception as e:
+            logging.warning(f"加载历史交易失败: {e}")
 
-    def record_trade(
-        self,
-        pnl: float,
-        direction: str,
-        volume: int,
-        entry_price: float,
-        exit_price: float,
-        entry_time: datetime,
-        exit_time: datetime,
-    ) -> None:
-        self.trades.append(
-            CompletedTrade(
-                pnl=pnl, direction=direction, volume=volume,
-                entry_price=entry_price, exit_price=exit_price,
-                entry_time=entry_time, exit_time=exit_time,
-            )
-        )
+    def _append_trade_file(self, trade: dict):
+        """单条交易追加到 JSONL（O(1)）"""
+        try:
+            with open(config.TRADES_HISTORY_FILE, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(trade, ensure_ascii=False) + '\n')
+        except Exception as e:
+            logging.warning(f"追加交易记录失败: {e}")
+
+    def _save_perf_state(self):
+        """保存 peak_balance/max_drawdown 以便跨重启恢复"""
+        try:
+            with open(config.PERF_STATE_FILE, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'peak_balance': self.peak_balance,
+                    'max_drawdown': self.max_drawdown,
+                    'peak_balance_time': self.peak_balance_time.isoformat() if self.peak_balance_time else None,
+                }, f, ensure_ascii=False)
+        except Exception as e:
+            logging.warning(f"保存绩效状态失败: {e}")
+
+    def _load_perf_state(self):
+        try:
+            if os.path.exists(config.PERF_STATE_FILE):
+                with open(config.PERF_STATE_FILE, 'r', encoding='utf-8') as f:
+                    st = json.load(f)
+                self.peak_balance = st.get('peak_balance', 0.0)
+                self.max_drawdown = st.get('max_drawdown', 0.0)
+                t = st.get('peak_balance_time')
+                if t:
+                    try:
+                        self.peak_balance_time = datetime.fromisoformat(t)
+                    except Exception:
+                        pass
+        except Exception as e:
+            logging.warning(f"加载绩效状态失败: {e}")
+    # ================================================
+
+    def _init_file(self):
+        self.metrics_file = config.METRICS_FILE
+        if not os.path.exists(self.metrics_file):
+            with open(self.metrics_file, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "timestamp", "balance", "peak_balance", "drawdown",
+                    "trade_count", "win_count", "loss_count", "win_rate",
+                    "avg_pnl", "avg_win", "avg_loss", "profit_factor",
+                    "max_drawdown", "current_streak"
+                ])
+
+    def record_trade(self, pnl: float, direction: str, volume: int,
+                     entry_price: float, exit_price: float,
+                     entry_time: datetime, exit_time: datetime):
+        """记录一次完整交易（开仓→平仓）"""
+        # 修复 M5: 交易持久化到 JSONL，重启后仍可统计胜率/盈亏比
+        trade = {
+            'pnl': pnl, 'direction': direction, 'volume': volume,
+            'entry_price': entry_price, 'exit_price': exit_price,
+            'entry_time': entry_time.isoformat() if hasattr(entry_time, 'isoformat') else str(entry_time),
+            'exit_time': exit_time.isoformat() if hasattr(exit_time, 'isoformat') else str(exit_time),
+        }
+        self.trades.append(trade)
+        self._append_trade_file(trade)
         self._flush()
 
-    def update_equity(self, balance: float, when: Optional[datetime] = None) -> None:
-        when = when or datetime.now()
+    # 修复 M5: 权益曲线保留最近 N 个点，防止无界增长
+    EQUITY_CURVE_MAX = 1000  # 30s 一个点 ≈ 8.3 小时
+
+    def update_equity(self, balance: float, when: datetime = None):
+        """每个 tick 更新权益曲线，计算回撤"""
+        if when is None:
+            when = datetime.now()
         self.equity_curve.append((when, balance))
+        if len(self.equity_curve) > self.EQUITY_CURVE_MAX:
+            self.equity_curve = self.equity_curve[-self.EQUITY_CURVE_MAX:]
         if balance > self.peak_balance:
             self.peak_balance = balance
             self.peak_balance_time = when
@@ -96,73 +130,77 @@ class PerformanceMetrics:
             dd = (self.peak_balance - balance) / self.peak_balance * 100
             if dd > self.max_drawdown:
                 self.max_drawdown = dd
+        # 修复 M5: 周期持久化 peak/drawdown（调用点已限频 30s）
+        self._save_perf_state()
 
-    def summary(self) -> MetricsSummary:
+    def summary(self) -> dict:
+        """计算并返回当前统计指标"""
         if not self.trades:
-            return MetricsSummary(max_drawdown=self.max_drawdown)
-
-        wins = [t for t in self.trades if t.pnl > 0]
-        losses = [t for t in self.trades if t.pnl <= 0]
-        win_sum = sum(t.pnl for t in wins)
-        loss_sum = abs(sum(t.pnl for t in losses))
-        pf = win_sum / loss_sum if loss_sum > 0 else float("inf")
-
+            return {
+                'trade_count': 0, 'win_count': 0, 'loss_count': 0,
+                'win_rate': 0, 'avg_pnl': 0, 'avg_win': 0, 'avg_loss': 0,
+                'profit_factor': 0, 'max_drawdown': self.max_drawdown,
+                'current_streak': 0
+            }
+        wins = [t for t in self.trades if t['pnl'] > 0]
+        losses = [t for t in self.trades if t['pnl'] <= 0]
+        win_sum = sum(t['pnl'] for t in wins)
+        loss_sum = abs(sum(t['pnl'] for t in losses))
+        pf = win_sum / loss_sum if loss_sum > 0 else float('inf')
+        # 连胜/连败
         streak = 0
         for t in reversed(self.trades):
-            sign = 1 if t.pnl > 0 else -1
-            if streak == 0 or (streak > 0 and sign > 0) or (streak < 0 and sign < 0):
-                streak += sign
+            if (t['pnl'] > 0 and streak >= 0) or (t['pnl'] <= 0 and streak <= 0):
+                streak += 1 if t['pnl'] > 0 else -1
             else:
                 break
+        return {
+            'trade_count': len(self.trades),
+            'win_count': len(wins),
+            'loss_count': len(losses),
+            'win_rate': len(wins) / len(self.trades) * 100,
+            'avg_pnl': sum(t['pnl'] for t in self.trades) / len(self.trades),
+            'avg_win': win_sum / len(wins) if wins else 0,
+            'avg_loss': loss_sum / len(losses) if losses else 0,
+            'profit_factor': pf,
+            'max_drawdown': self.max_drawdown,
+            'current_streak': streak
+        }
 
-        return MetricsSummary(
-            trade_count=len(self.trades),
-            win_count=len(wins),
-            loss_count=len(losses),
-            win_rate=len(wins) / len(self.trades) * 100,
-            avg_pnl=sum(t.pnl for t in self.trades) / len(self.trades),
-            avg_win=win_sum / len(wins) if wins else 0.0,
-            avg_loss=loss_sum / len(losses) if losses else 0.0,
-            profit_factor=pf,
-            max_drawdown=self.max_drawdown,
-            current_streak=streak,
-        )
-
-    def _flush(self) -> None:
+    def _flush(self):
+        """把当前统计指标写入文件（追加）"""
         s = self.summary()
-        last_balance = self.equity_curve[-1][1] if self.equity_curve else 0.0
+        last_balance = self.equity_curve[-1][1] if self.equity_curve else 0
         try:
-            with self.metrics_file.open("a", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow([
+            with open(self.metrics_file, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     f"{last_balance:.2f}", f"{self.peak_balance:.2f}",
                     f"{self.max_drawdown:.2f}",
-                    s.trade_count, s.win_count, s.loss_count,
-                    f"{s.win_rate:.2f}",
-                    f"{s.avg_pnl:.2f}", f"{s.avg_win:.2f}", f"{s.avg_loss:.2f}",
-                    f"{s.profit_factor:.2f}" if s.profit_factor != float("inf") else "inf",
-                    f"{s.max_drawdown:.2f}", s.current_streak,
+                    s['trade_count'], s['win_count'], s['loss_count'],
+                    f"{s['win_rate']:.2f}",
+                    f"{s['avg_pnl']:.2f}", f"{s['avg_win']:.2f}", f"{s['avg_loss']:.2f}",
+                    f"{s['profit_factor']:.2f}" if s['profit_factor'] != float('inf') else "inf",
+                    f"{s['max_drawdown']:.2f}", s['current_streak']
                 ])
-        except Exception as exc:
-            logger.error("Write performance metrics file failed: %s", exc)
+        except Exception as e:
+            logging.error(f"写入绩效文件失败: {e}")
 
-    def print_daily_report(self) -> str:
+    def print_daily_report(self):
+        """收盘后打印日报"""
         s = self.summary()
-        rr = (s.avg_win / s.avg_loss) if s.avg_loss > 0 else 0
-        report = (
-            "\n===== 交易日报 =====\n"
-            f"交易笔数: {s.trade_count} (胜 {s.win_count} / 负 {s.loss_count})\n"
-            f"胜率: {s.win_rate:.2f}%\n"
-            f"平均盈亏: {s.avg_pnl:.2f} 元\n"
-            f"平均盈利: {s.avg_win:.2f} 元\n"
-            f"平均亏损: {s.avg_loss:.2f} 元\n"
-            f"盈亏比: {rr:.2f}\n"
-            f"Profit Factor: {s.profit_factor:.2f}\n"
-            f"最大回撤: {s.max_drawdown:.2f}%\n"
-            f"当前连击: {s.current_streak:+d}\n"
-        )
-        logger.info(report)
+        report = f"""
+===== 交易日报 =====
+交易笔数: {s['trade_count']} (胜 {s['win_count']} / 负 {s['loss_count']})
+胜率: {s['win_rate']:.2f}%
+平均盈亏: {s['avg_pnl']:.2f} 元
+平均盈利: {s['avg_win']:.2f} 元
+平均亏损: {s['avg_loss']:.2f} 元
+盈亏比: {(s['avg_win']/s['avg_loss']) if s['avg_loss'] > 0 else 0:.2f}
+Profit Factor: {s['profit_factor']:.2f}
+最大回撤: {s['max_drawdown']:.2f}%
+当前连击: {s['current_streak']:+d}
+"""
+        logging.info(report)
         return report
-
-
-__all__ = ["CompletedTrade", "MetricsSummary", "PerformanceMetrics"]

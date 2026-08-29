@@ -1,93 +1,56 @@
-"""钉钉机器人通知封装.
+"""notifier — 钉钉通知（真源 L52–96 的 _safe_send 限频/去重逻辑类化迁移）。
 
-- Webhook 与 secret 从 :mod:`quantai.config` 读取
-- 失败静默吞掉，不影响主交易循环
-- 支持 ENABLE_NOTIFY=False 完全关闭（本地调试）
+行为保持（与原版 _safe_send 逐条对齐）:
+1. 全局速率限制: 滑动窗口 60s 内最多 NOTIFY_RATE_LIMIT(10) 条（非关键消息）
+2. 同类消息去重: 相同内容 NOTIFY_DEDUP_WINDOW(300s) 内只发一次（关键消息也去重）
+3. 关键消息分级: 命中 NOTIFY_CRITICAL_KEYWORDS 的消息绕过限频（8/27 增强）
+4. 去重表内存保护: 只保留最近 NOTIFY_DEDUP_TABLE_MAX(200) 条
+5. 发送失败只记日志，不中断主流程
+
+与原版差异: 原版通过 monkey-patch notifycation.send_dingtalk_message 全局生效；
+本版封装为 DingTalkNotifier 类，sender 可注入（dry_run/测试时注入假 sender）。
 """
-from __future__ import annotations
-
-import base64
-import hashlib
-import hmac
 import logging
+import threading
 import time
-import urllib.parse
-from typing import Optional
+from typing import Callable, List, Dict
 
-import requests
-
-from .config import dingtalk
-
-logger = logging.getLogger(__name__)
+from . import config
 
 
 class DingTalkNotifier:
-    """钉钉自定义机器人 Markdown 通知客户端."""
+    def __init__(self, sender: Callable[[str], None] = None):
+        if sender is None:
+            # 默认使用 vendor 钉钉传输层（原版 notifycation.send_dingtalk_message）
+            from .vendor import notifycation
+            sender = notifycation.send_dingtalk_message
+        self._sender = sender
+        self._lock = threading.Lock()
+        self._timestamps: List[float] = []       # (timestamp) 滑动窗口
+        self._last_sent: Dict[str, float] = {}   # msg -> last_sent_time
 
-    def __init__(
-        self,
-        webhook: Optional[str] = None,
-        secret: Optional[str] = None,
-        enabled: Optional[bool] = None,
-        timeout: int = 10,
-    ) -> None:
-        self.webhook = webhook if webhook is not None else dingtalk.webhook
-        self.secret = secret if secret is not None else dingtalk.secret
-        self.enabled = enabled if enabled is not None else dingtalk.enabled
-        self.timeout = timeout
-
-    def _signed_url(self) -> str:
-        if not self.secret:
-            return self.webhook
-        ts = str(round(time.time() * 1000))
-        sign_str = f"{ts}\n{self.secret}"
-        mac = hmac.new(self.secret.encode(), sign_str.encode(), digestmod=hashlib.sha256).digest()
-        sign = urllib.parse.quote_plus(base64.b64encode(mac))
-        return f"{self.webhook}&timestamp={ts}&sign={sign}"
-
-    def send(self, content: str, title: str = "QuantAI 提醒", at_all: bool = True) -> bool:
-        """发送 Markdown 消息；任何异常被吞掉并记日志."""
-        if not self.enabled:
-            logger.debug("DingTalk disabled, skip: %s", content[:80])
-            return False
-        if not self.webhook:
-            logger.warning("DingTalk webhook empty, skip notification.")
-            return False
+    def send(self, msg: str) -> None:
+        """限频+去重后的安全发送（真源 _safe_send L71–94 逐行对齐）。"""
+        now = time.time()
+        is_critical = any(k in msg for k in config.NOTIFY_CRITICAL_KEYWORDS)
+        with self._lock:
+            # 1. 全局速率限制：滑动窗口 60s 内最多 NOTIFY_RATE_LIMIT 条
+            self._timestamps[:] = [t for t in self._timestamps if now - t < 60]
+            if not is_critical and len(self._timestamps) >= config.NOTIFY_RATE_LIMIT:
+                logging.warning(f"钉钉限频: 60秒内超过{config.NOTIFY_RATE_LIMIT}条，丢弃消息: {msg[:60]}")
+                return
+            # 2. 同类消息去重：相同内容在窗口内只发一次
+            last = self._last_sent.get(msg)
+            if last is not None and now - last < config.NOTIFY_DEDUP_WINDOW:
+                logging.info(f"钉钉去重: {config.NOTIFY_DEDUP_WINDOW}秒内已发送过同类消息，跳过: {msg[:60]}")
+                return
+            self._timestamps.append(now)
+            self._last_sent[msg] = now
+            # 内存保护: 去重表只保留最近 200 条
+            if len(self._last_sent) > config.NOTIFY_DEDUP_TABLE_MAX:
+                for k in list(self._last_sent.keys())[:-config.NOTIFY_DEDUP_TABLE_MAX]:
+                    self._last_sent.pop(k, None)
         try:
-            payload = {
-                "msgtype": "markdown",
-                "markdown": {"title": title, "text": content},
-                "at": {"isAtAll": at_all},
-            }
-            resp = requests.post(
-                self._signed_url(),
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=self.timeout,
-            )
-            if resp.status_code == 200:
-                logger.info("DingTalk message sent.")
-                return True
-            logger.error("DingTalk send failed: %s", resp.text)
-            return False
-        except Exception as exc:
-            logger.error("DingTalk network error: %s", exc)
-            return False
-
-
-_default_notifier: Optional[DingTalkNotifier] = None
-
-
-def get_notifier() -> DingTalkNotifier:
-    global _default_notifier
-    if _default_notifier is None:
-        _default_notifier = DingTalkNotifier()
-    return _default_notifier
-
-
-def notify(content: str, title: str = "QuantAI 提醒", at_all: bool = True) -> bool:
-    """模块级便捷函数：调用默认 notifier."""
-    return get_notifier().send(content, title=title, at_all=at_all)
-
-
-__all__ = ["DingTalkNotifier", "get_notifier", "notify"]
+            self._sender(msg)
+        except Exception as e:
+            logging.error(f"钉钉发送失败（不影响交易）: {e}")

@@ -1,3 +1,4 @@
+import os
 import re
 import json
 import logging
@@ -7,6 +8,136 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
 import requests
+
+
+# 共享缓存：与 finanCalc/report_news_data.py 共用同一文件
+_JIN10_Z3C_CACHE_FILE = r"D:\PythonProject\MainToy\.jin10_z3c_cache.json"
+
+
+def _load_cached_z3c_url() -> Optional[str]:
+    """读取本地缓存的 z3c 域名。文件不存在或解析失败返回 None。"""
+    try:
+        if os.path.exists(_JIN10_Z3C_CACHE_FILE):
+            with open(_JIN10_Z3C_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                url = data.get("url")
+                if isinstance(url, str) and url.startswith("https://") and ".z3c.jin10.com" in url:
+                    return url
+    except Exception as e:
+        logging.debug(f"读取 z3c 缓存失败: {e}")
+    return None
+
+
+def _save_cached_z3c_url(url: str) -> None:
+    """把探测成功的 z3c 域名写入本地缓存。"""
+    try:
+        os.makedirs(os.path.dirname(_JIN10_Z3C_CACHE_FILE), exist_ok=True)
+        with open(_JIN10_Z3C_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"url": url, "ts": time.time()}, f, ensure_ascii=False)
+        logging.info(f"已缓存 z3c 域名: {url}")
+    except Exception as e:
+        logging.warning(f"写入 z3c 缓存失败: {e}")
+
+
+def _invalidate_z3c_cache() -> None:
+    """使用缓存的 URL 请求失败时调用，清除缓存以便下次重新探测。"""
+    try:
+        if os.path.exists(_JIN10_Z3C_CACHE_FILE):
+            os.remove(_JIN10_Z3C_CACHE_FILE)
+            logging.info("已清除 z3c 缓存（下次将重新探测）")
+    except Exception as e:
+        logging.debug(f"清除 z3c 缓存失败: {e}")
+
+
+def _detect_z3c_base_url() -> str:
+    """
+    实际探测最新的 z3c 域名（无缓存时调用）。
+    策略：从 index.js 抓出所有 32-hex 候选域名，逐个实测 /flash 接口，
+          第一个返回 200/400 的就是当前有效的。
+    探测成功会写入缓存；探测失败返回硬编码 fallback（不写缓存）。
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0",
+        "Referer": "https://www.jin10.com/",
+    }
+    session = requests.Session()
+
+    try:
+        # 1. 抓首页，定位 index.js
+        resp_home = session.get("https://www.jin10.com/", headers=headers, timeout=10)
+        resp_home.raise_for_status()
+        match_js = re.search(r'/new/js/index\.([a-f0-9]+)\.js', resp_home.text)
+        if not match_js:
+            raise ValueError("首页中未找到 index.js 路径")
+        js_url = f"https://www.jin10.com/new/js/index.{match_js.group(1)}.js"
+        logging.info(f"获取到 JS 文件: {js_url}")
+
+        # 2. 抓 JS 内容
+        resp_js = session.get(js_url, headers=headers, timeout=10)
+        resp_js.raise_for_status()
+        js_text = resp_js.text
+
+        # 3. 提取所有 32-hex 候选 z3c 域名（去重保序）
+        candidates = re.findall(r'([a-f0-9]{32})\.z3c\.jin10\.com', js_text)
+        seen, ordered = set(), []
+        for h in candidates:
+            if h not in seen:
+                seen.add(h)
+                ordered.append(h)
+        if not ordered:
+            raise ValueError("JS 中未找到任何 z3c 候选域名")
+        logging.info(f"发现 {len(ordered)} 个 z3c 候选，开始探测...")
+
+        # 4. 逐个探测（200=命中，400=后端在但参数错 = 域名有效）
+        probe_params = json.dumps(
+            {"hot": ["火", "热", "沸", "爆"],
+             "max_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+             "channel": [1, 5]},
+            separators=(',', ':'),
+        )
+        probe_headers = {
+            **headers,
+            "X-App-Id": "bVBF4FyRTn5NJF5n",
+            "X-Version": "1.0",
+            "Handleerror": "true",
+        }
+
+        for i, h in enumerate(ordered):
+            probe_url = f"https://{h}.z3c.jin10.com/flash?params={requests.utils.quote(probe_params)}"
+            try:
+                r = session.get(probe_url, headers=probe_headers, timeout=6)
+                if r.status_code in (200, 400):
+                    base_url = f"https://{h}.z3c.jin10.com"
+                    logging.info(f"[{i + 1}/{len(ordered)}] 命中: {base_url} (status={r.status_code})")
+                    _save_cached_z3c_url(base_url)
+                    return base_url
+                logging.debug(f"[{i + 1}/{len(ordered)}] {h} 返回 {r.status_code}，跳过")
+            except requests.exceptions.RequestException as e:
+                logging.debug(f"[{i + 1}/{len(ordered)}] {h} 异常: {e}")
+                continue
+
+        raise ValueError(f"所有 {len(ordered)} 个候选 z3c 域名均不可达")
+
+    except Exception as e:
+        logging.error(f"动态探测 z3c 域名失败: {e}，使用硬编码 fallback。")
+        return Jin10FlashFetcher.FALLBACK_BASE_URL
+
+
+def get_latest_z3c_base_url(force_refresh: bool = False) -> str:
+    """
+    获取快讯接口域名。优先使用本地缓存，缓存缺失或 force_refresh=True 时才探测。
+
+    行为：
+    - 缓存存在 → 直接返回（零网络开销）
+    - 缓存不存在 → 探测 → 成功则写入缓存并返回
+    - 探测失败 → 返回硬编码 fallback（不写缓存，下次还会再探测）
+    """
+    if not force_refresh:
+        cached = _load_cached_z3c_url()
+        if cached:
+            logging.debug(f"使用缓存的 z3c 域名: {cached}")
+            return cached
+    return _detect_z3c_base_url()
 
 
 class Jin10FlashFetcher:
@@ -43,53 +174,10 @@ class Jin10FlashFetcher:
 
     def _get_latest_base_url(self) -> str:
         """
-        从金十首页JS中动态提取最新的z3c子域名
-
-        Returns
-        -------
-        str
-            完整的API基础URL，例如 https://{32位hex}.z3c.jin10.com
+        获取快讯接口域名。优先使用本地缓存，缓存缺失时探测。
+        委托给模块级函数 get_latest_z3c_base_url()，保证两个脚本共享缓存。
         """
-        headers = {
-            "User-Agent": self._session.headers["User-Agent"],
-            "Referer": self._session.headers["Referer"],
-        }
-
-        try:
-            # 1. 获取首页，提取最新 index.js 路径
-            resp_home = self._session.get("https://www.jin10.com/", headers=headers, timeout=10)
-            resp_home.raise_for_status()
-
-            match_js = re.search(r'/new/js/index\.([a-f0-9]+)\.js', resp_home.text)
-            if not match_js:
-                raise ValueError("未找到 index.js 路径")
-
-            js_url = f"https://www.jin10.com/new/js/index.{match_js.group(1)}.js"
-            logging.info(f"获取到 JS 文件: {js_url}")
-
-            # 2. 获取 JS 内容
-            resp_js = self._session.get(js_url, headers=headers, timeout=10)
-            resp_js.raise_for_status()
-            js_text = resp_js.text
-
-            # 3. 匹配快讯接口域名模式
-            pattern = r',\s*b\s*=\s*Object\(s\.a\)\s*\(\s*\{?\s*baseURL:\s*"//([a-f0-9]{32})\.z3c\.jin10\.com"'
-            match = re.search(pattern, js_text)
-            if match:
-                base_url = f"https://{match.group(1)}.z3c.jin10.com"
-                logging.info(f"匹配到 T 对应的域名: {base_url}")
-                return base_url
-
-            # 备用模式
-            match_z3c = re.search(r'([a-f0-9]{32})\.z3c\.jin10\.com', js_text)
-            if match_z3c:
-                return f"https://{match_z3c.group(1)}.z3c.jin10.com"
-
-            raise ValueError("未找到任何 z3c 域名")
-
-        except Exception as e:
-            logging.error(f"获取最新域名失败: {e}，使用备用硬编码域名。")
-            return self.FALLBACK_BASE_URL
+        return get_latest_z3c_base_url()
 
     @property
     def api_base_url(self) -> str:
@@ -148,6 +236,7 @@ class Jin10FlashFetcher:
         target_start_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
 
         page = 1
+        cache_refreshed_this_session = False  # 本次任务内只重探测一次
         while True:
             # 构造请求参数
             params_obj = {
@@ -161,6 +250,19 @@ class Jin10FlashFetcher:
             logging.info(f"第 {page} 页请求，max_time = {current_max_time}")
 
             data = self._request_with_retry(url, api_headers)
+
+            # 重试耗尽 → 怀疑缓存的 base_url 已失效，强制重新探测一次
+            if data is None and not cache_refreshed_this_session:
+                logging.warning("连续重试失败，怀疑缓存域名已失效，强制重新探测...")
+                _invalidate_z3c_cache()
+                new_url = _detect_z3c_base_url()
+                if new_url != base_url:
+                    base_url = new_url
+                    cache_refreshed_this_session = True
+                    url = f"{base_url}{api_path}?params={requests.utils.quote(params_str)}"
+                    logging.info(f"使用新域名重试本页: {base_url}")
+                    data = self._request_with_retry(url, api_headers, max_retries=3)
+
             if data is None:
                 logging.error("连续重试失败，终止抓取。")
                 break
@@ -261,5 +363,9 @@ if __name__ == "__main__":
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
     fetcher = Jin10FlashFetcher()
-    news_list = fetcher.fetch_important_news("2026-6-10 00:00:00", "2026-6-10 12:59:59")
+    # 注意：日期必须 YYYY-MM-DD 格式（月/日必须补零），API 会拒绝 2026-6-10 这种
+    now = datetime.now()
+    end = now.strftime("%Y-%m-%d %H:%M:%S")
+    start = (now - timedelta(hours=6)).strftime("%Y-%m-%d %H:%M:%S")
+    news_list = fetcher.fetch_important_news(start, end)
     print(news_list)
